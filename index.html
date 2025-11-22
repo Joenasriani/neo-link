@@ -1,0 +1,456 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NEO-LINK // CHUNKED TRANSFER</title>
+    
+    <!-- React & ReactDOM -->
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    
+    <!-- Babel for JSX -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- PeerJS -->
+    <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
+
+    <!-- Icons -->
+    <script src="https://unpkg.com/@phosphor-icons/web"></script>
+
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700;800&display=swap');
+
+        body {
+            background-color: #050505;
+            font-family: 'JetBrains Mono', monospace;
+            color: #00ff41;
+            overflow-x: hidden;
+        }
+
+        ::-webkit-scrollbar { width: 8px; }
+        ::-webkit-scrollbar-track { background: #111; }
+        ::-webkit-scrollbar-thumb { background: #00ff41; }
+
+        .scanlines {
+            background: linear-gradient(to bottom, rgba(255,255,255,0), rgba(255,255,255,0) 50%, rgba(0,0,0,0.2) 50%, rgba(0,0,0,0.2));
+            background-size: 100% 4px;
+            position: fixed; top: 0; right: 0; bottom: 0; left: 0;
+            pointer-events: none; z-index: 50;
+        }
+        
+        .glow-text { text-shadow: 0 0 10px rgba(0, 255, 65, 0.7); }
+        
+        .progress-bar-striped {
+            background-image: linear-gradient(45deg,rgba(0,0,0,.15) 25%,transparent 25%,transparent 50%,rgba(0,0,0,.15) 50%,rgba(0,0,0,.15) 75%,transparent 75%,transparent);
+            background-size: 1rem 1rem;
+        }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+    <div class="scanlines"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useRef } = React;
+
+        // --- CONFIGURATION ---
+        const CHUNK_SIZE = 16384; // 16KB safe limit
+        const CHUNK_DELAY = 50;   // 50ms to prevent congestion
+
+        // --- HELPER: FILE READER ---
+        const readFileChunk = (file, offset, length) => {
+            return new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                const blob = file.slice(offset, offset + length);
+                reader.onload = (e) => resolve(e.target.result);
+                reader.onerror = (e) => reject(e);
+                reader.readAsArrayBuffer(blob);
+            });
+        };
+
+        // --- SENDER COMPONENT ---
+        const SendTab = ({ setGlobalStatus }) => {
+            const [file, setFile] = useState(null);
+            const [code, setCode] = useState(null);
+            const [progress, setProgress] = useState(0);
+            const [transferState, setTransferState] = useState('idle'); // idle, waiting, sending, complete
+            const peerRef = useRef(null);
+            const connRef = useRef(null);
+
+            useEffect(() => {
+                return () => {
+                    if (peerRef.current) peerRef.current.destroy();
+                };
+            }, []);
+
+            const handleFileChange = (e) => {
+                if (e.target.files[0]) {
+                    setFile(e.target.files[0]);
+                    initializePeer();
+                }
+            };
+
+            const initializePeer = () => {
+                const generatedCode = Math.floor(100000 + Math.random() * 900000).toString();
+                setCode(generatedCode);
+                setTransferState('waiting');
+                setGlobalStatus(">> INITIALIZING NODE. WAITING FOR HANDSHAKE...");
+
+                const peer = new Peer(generatedCode, {
+                    debug: 1,
+                    config: { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] }
+                });
+
+                peerRef.current = peer;
+
+                peer.on('connection', (conn) => {
+                    setGlobalStatus(">> PEER LINKED. PREPARING UPLOAD...");
+                    connRef.current = conn;
+                    
+                    conn.on('open', () => {
+                        startChunkedTransfer(conn);
+                    });
+                });
+            };
+
+            const startChunkedTransfer = async (conn) => {
+                if (!file) return;
+                setTransferState('sending');
+                setGlobalStatus(`>> STARTING UPLOAD: ${file.name}`);
+
+                try {
+                    const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+                    
+                    // 1. Send Metadata
+                    conn.send({
+                        type: 'meta',
+                        name: file.name,
+                        size: file.size,
+                        fileType: file.type,
+                        totalChunks: totalChunks
+                    });
+
+                    // 2. Send Chunks
+                    let offset = 0;
+                    for (let i = 0; i < totalChunks; i++) {
+                        const chunkData = await readFileChunk(file, offset, CHUNK_SIZE);
+                        
+                        conn.send({
+                            type: 'chunk',
+                            index: i,
+                            data: chunkData
+                        });
+
+                        offset += CHUNK_SIZE;
+                        
+                        // Update UI
+                        const percent = Math.round(((i + 1) / totalChunks) * 100);
+                        setProgress(percent);
+
+                        // Mandatory Delay
+                        await new Promise(r => setTimeout(r, CHUNK_DELAY));
+                    }
+
+                    setGlobalStatus(">> UPLOAD COMPLETE. CLOSING LINK.");
+                    setTransferState('complete');
+                    setTimeout(() => {
+                        conn.close();
+                        setTransferState('idle');
+                        setFile(null);
+                        setCode(null);
+                        setProgress(0);
+                    }, 3000);
+
+                } catch (err) {
+                    console.error(err);
+                    setGlobalStatus("!! UPLOAD ERROR: ABORTED !!");
+                    setTransferState('idle');
+                }
+            };
+
+            return (
+                <div className="flex flex-col items-center w-full animate-fade-in space-y-6">
+                    {!file ? (
+                        <label className="flex flex-col items-center justify-center w-full h-64 border-2 border-dashed border-[#00ff41] rounded-lg cursor-pointer hover:bg-green-900/20 transition-all group">
+                            <i className="ph ph-upload-simple text-6xl mb-4 text-green-500 group-hover:scale-110 transition-transform"></i>
+                            <p className="mb-2 text-sm text-green-400 font-bold">SELECT DATA PACKAGE</p>
+                            <input type="file" className="hidden" onChange={handleFileChange} />
+                        </label>
+                    ) : (
+                        <div className="w-full text-center">
+                            <div className="mb-6 p-4 border border-green-900 bg-green-900/10 rounded">
+                                <p className="text-xs text-green-500">TARGET FILE:</p>
+                                <p className="text-lg font-bold truncate">{file.name}</p>
+                                <p className="text-xs text-green-600">{(file.size / 1024 / 1024).toFixed(2)} MB</p>
+                            </div>
+
+                            {transferState === 'waiting' && code && (
+                                <div className="animate-pulse">
+                                    <p className="text-sm text-green-500 mb-2 tracking-widest">SECURE FREQUENCY</p>
+                                    <div className="text-6xl md:text-8xl font-extrabold glow-text text-white">
+                                        {code.substring(0, 3)}-{code.substring(3, 6)}
+                                    </div>
+                                </div>
+                            )}
+
+                            {transferState === 'sending' && (
+                                <div className="w-full space-y-2">
+                                    <div className="flex justify-between text-xs text-green-400">
+                                        <span>UPLOADING PACKETS...</span>
+                                        <span>{progress}%</span>
+                                    </div>
+                                    <div className="w-full h-4 bg-gray-900 border border-green-900 rounded overflow-hidden relative">
+                                        <div 
+                                            className="h-full bg-green-500 progress-bar-striped transition-all duration-100" 
+                                            style={{ width: `${progress}%` }}
+                                        ></div>
+                                    </div>
+                                </div>
+                            )}
+
+                            {transferState === 'complete' && (
+                                <div className="text-xl font-bold text-green-400 animate-bounce">
+                                    >> MISSION SUCCESSFUL
+                                </div>
+                            )}
+                        </div>
+                    )}
+                </div>
+            );
+        };
+
+        // --- RECEIVER COMPONENT ---
+        const ReceiveTab = ({ setGlobalStatus }) => {
+            const [inputCode, setInputCode] = useState("");
+            const [progress, setProgress] = useState(0);
+            const [isReceiving, setIsReceiving] = useState(false);
+            
+            // Refs for high-frequency data handling
+            const peerRef = useRef(null);
+            const chunksRef = useRef([]);
+            const metaRef = useRef(null);
+
+            const handleConnect = () => {
+                if (inputCode.length < 6) return;
+                
+                const cleanCode = inputCode.replace(/-/g, '');
+                setGlobalStatus(`>> SCANNING FOR FREQUENCY ${cleanCode}...`);
+                setIsReceiving(true);
+                setProgress(0);
+                chunksRef.current = []; // Reset chunks
+
+                const peer = new Peer(null, {
+                    debug: 1,
+                    config: { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] }
+                });
+                peerRef.current = peer;
+
+                peer.on('open', () => {
+                    const conn = peer.connect(cleanCode);
+                    
+                    conn.on('open', () => {
+                        setGlobalStatus(">> LINK ESTABLISHED. AWAITING STREAM...");
+                    });
+
+                    conn.on('data', (data) => {
+                        handleIncomingData(data, conn);
+                    });
+
+                    conn.on('close', () => {
+                        // Cleanup if closed externally
+                         if (progress < 100 && progress > 0) {
+                            setGlobalStatus("!! CONNECTION LOST !!");
+                            setIsReceiving(false);
+                        }
+                    });
+                    
+                    conn.on('error', () => {
+                        setGlobalStatus("!! CONNECTION ERROR !!");
+                        setIsReceiving(false);
+                    });
+                });
+                
+                peer.on('error', () => {
+                    setGlobalStatus("!! FREQUENCY NOT FOUND !!");
+                    setIsReceiving(false);
+                });
+            };
+
+            const handleIncomingData = (data, conn) => {
+                try {
+                    // 1. Handle Metadata
+                    if (data.type === 'meta') {
+                        metaRef.current = data;
+                        chunksRef.current = new Array(data.totalChunks);
+                        setGlobalStatus(`>> INCOMING: ${data.name} (${(data.size/1024/1024).toFixed(2)} MB)`);
+                        return;
+                    }
+
+                    // 2. Handle Chunks
+                    if (data.type === 'chunk') {
+                        if (!metaRef.current) return; // Safety check
+                        
+                        // Store chunk at correct index
+                        chunksRef.current[data.index] = data.data;
+                        
+                        // Calculate Progress
+                        const receivedCount = chunksRef.current.filter(Boolean).length;
+                        const total = metaRef.current.totalChunks;
+                        const percent = Math.round((receivedCount / total) * 100);
+                        
+                        // Only trigger render if percentage changes to save resources
+                        setProgress(prev => (prev !== percent ? percent : prev));
+
+                        // 3. Reassembly on Completion
+                        if (receivedCount === total) {
+                            setGlobalStatus(">> ALL PACKETS SECURED. REASSEMBLING...");
+                            finalizeDownload();
+                            conn.close();
+                        }
+                    }
+                } catch (err) {
+                    console.error(err);
+                    setGlobalStatus("!! PACKET CORRUPTION DETECTED !!");
+                }
+            };
+
+            const finalizeDownload = () => {
+                const blob = new Blob(chunksRef.current, { type: metaRef.current.fileType });
+                const url = URL.createObjectURL(blob);
+                
+                const link = document.createElement('a');
+                link.download = metaRef.current.name;
+                link.href = url;
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+                
+                // Cleanup
+                window.URL.revokeObjectURL(url);
+                setGlobalStatus(">> ASSET WRITTEN TO DISK.");
+                
+                setTimeout(() => {
+                    setIsReceiving(false);
+                    setProgress(0);
+                    chunksRef.current = [];
+                    metaRef.current = null;
+                }, 2000);
+            };
+
+            return (
+                <div className="flex flex-col items-center w-full space-y-6">
+                    {!isReceiving ? (
+                        <>
+                            <div className="w-full">
+                                <label className="block text-xs text-green-500 mb-2 tracking-widest uppercase">Enter Source Frequency</label>
+                                <input 
+                                    type="text" 
+                                    value={inputCode}
+                                    onChange={(e) => setInputCode(e.target.value)}
+                                    placeholder="000-000"
+                                    maxLength="7"
+                                    className="w-full bg-black border-2 border-green-800 focus:border-green-400 text-center text-4xl md:text-6xl py-4 outline-none text-white placeholder-green-900/50 font-bold tracking-widest rounded"
+                                />
+                            </div>
+                            <button 
+                                onClick={handleConnect}
+                                disabled={inputCode.length < 6}
+                                className={`w-full py-6 text-xl font-bold border-2 border-green-500 bg-green-900/20 text-green-400 rounded uppercase tracking-widest hover:bg-green-500 hover:text-black transition-all
+                                    ${inputCode.length < 6 ? 'opacity-50 cursor-not-allowed' : ''}`}
+                            >
+                                Initiate Downlink
+                            </button>
+                        </>
+                    ) : (
+                        <div className="w-full text-center space-y-4">
+                            <div className="animate-pulse mb-4">
+                                <i className="ph ph-download-simple text-6xl text-green-500"></i>
+                            </div>
+                            <div>
+                                <p className="text-xl font-bold text-white mb-2">RECEIVING DATA STREAM</p>
+                                <div className="flex justify-between text-xs text-green-400 mb-1">
+                                    <span>PACKETS SECURED</span>
+                                    <span>{progress}%</span>
+                                </div>
+                                <div className="w-full h-6 bg-gray-900 border border-green-900 rounded overflow-hidden relative">
+                                    <div 
+                                        className="h-full bg-green-500 progress-bar-striped transition-all duration-200" 
+                                        style={{ width: `${progress}%` }}
+                                    ></div>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+                </div>
+            );
+        };
+
+        // --- MAIN APP ---
+        const App = () => {
+            const [activeTab, setActiveTab] = useState('send');
+            const [logs, setLogs] = useState([">> SYSTEM READY", ">> PROTOCOL V2.0 LOADED"]);
+
+            const addLog = (msg) => setLogs(prev => [msg, ...prev].slice(0, 6));
+
+            return (
+                <div className="min-h-screen flex flex-col items-center p-4 md:p-8 max-w-2xl mx-auto relative z-10">
+                    <header className="w-full flex justify-between items-end mb-12 border-b-2 border-green-800 pb-4">
+                        <div>
+                            <h1 className="text-3xl md:text-4xl font-black italic tracking-tighter glow-text">NEO-LINK</h1>
+                            <p className="text-xs text-green-600">CHUNKED MESH TRANSFER</p>
+                        </div>
+                        <div className="text-right hidden md:block text-xs text-green-800">
+                            <p>CHUNK_SIZE: 16KB</p>
+                            <p>LATENCY_PAD: 50MS</p>
+                        </div>
+                    </header>
+
+                    <main className="w-full bg-gray-900/80 border border-green-900 backdrop-blur-md p-1 rounded-lg shadow-[0_0_30px_rgba(0,255,65,0.15)]">
+                        <div className="flex w-full mb-1">
+                            {['send', 'receive'].map(tab => (
+                                <button 
+                                    key={tab}
+                                    onClick={() => setActiveTab(tab)}
+                                    className={`flex-1 py-4 font-bold tracking-widest uppercase transition-colors ${
+                                        activeTab === tab 
+                                        ? 'bg-green-500 text-black' 
+                                        : 'bg-black text-green-600 hover:bg-green-900/30'
+                                    }`}
+                                >
+                                    {tab}
+                                </button>
+                            ))}
+                        </div>
+
+                        <div className="bg-black border-2 border-green-900 p-6 md:p-10 min-h-[450px] flex items-center relative">
+                            <div className="absolute top-2 left-2 text-[10px] text-green-900 font-bold">ENCRYPTION: DTLS 1.2</div>
+                            {activeTab === 'send' ? <SendTab setGlobalStatus={addLog} /> : <ReceiveTab setGlobalStatus={addLog} />}
+                        </div>
+                    </main>
+
+                    <div className="w-full mt-6 border-t border-green-900 pt-4">
+                        <div className="flex items-center gap-2 mb-2">
+                            <div className="w-2 h-2 bg-green-500 rounded-full animate-pulse"></div>
+                            <span className="text-xs font-bold bg-green-900/30 px-2 py-0.5 rounded">KERNEL LOG</span>
+                        </div>
+                        <div className="font-mono text-xs space-y-1 text-green-400/80 h-24 overflow-hidden">
+                            {logs.map((log, i) => (
+                                <div key={i} className={i === 0 ? "text-green-300 font-bold" : "opacity-50"}>{log}</div>
+                            ))}
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
+
+
