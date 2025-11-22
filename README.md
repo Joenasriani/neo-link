@@ -4,7 +4,7 @@ A sleek, terminal-inspired, **peer-to-peer file transfer web app** built with Re
 
 Designed for creatives, developers, and educators who need fast, private, and offline-capable file sharing—ideal for workshops, on-set media exchange, or quick collaboration in environments like Dubai’s fast-paced production studios.
 
-![NEO-LINK Demo](https://joenasriani.github.io/neo-link/)
+>> https://joenasriani.github.io/neo-link/
 
 ---
 
