@@ -58,8 +58,25 @@
         const { useState, useEffect, useRef } = React;
 
         // --- CONFIGURATION ---
-        const CHUNK_SIZE = 16384; // 16KB safe limit
-        const CHUNK_DELAY = 50;   // 50ms to prevent congestion
+        const CHUNK_SIZE = 16384;        // 16KB per chunk
+        const MAX_BUFFERED_AMOUNT = 262144; // 256KB backpressure threshold
+        const CONNECT_TIMEOUT_MS = 30000;   // 30s connection timeout for receiver
+
+        // --- PEERJS ERROR TYPE → HUMAN MESSAGE ---
+        const PEER_ERROR_MESSAGES = {
+            'peer-unavailable':  '!! FREQUENCY NOT FOUND. CHECK THE CODE !!',
+            'network':           '!! NETWORK ERROR. CHECK CONNECTION !!',
+            'server-error':      '!! SIGNALING SERVER ERROR !!',
+            'socket-error':      '!! SOCKET ERROR !!',
+            'socket-closed':     '!! SOCKET CLOSED UNEXPECTEDLY !!',
+            'unavailable-id':    '!! FREQUENCY ALREADY IN USE !!',
+            'invalid-id':        '!! INVALID FREQUENCY CODE !!',
+            'ssl-unavailable':   '!! SSL/HTTPS REQUIRED FOR WEBRTC !!',
+            'disconnected':      '!! DISCONNECTED FROM SIGNALING SERVER !!',
+            'webrtc':            '!! WEBRTC NOT SUPPORTED IN THIS BROWSER !!',
+        };
+        const peerErrorMsg = (err) =>
+            PEER_ERROR_MESSAGES[err.type] || `!! PEER ERROR: ${err.message || err.type || 'UNKNOWN'} !!`;
 
         // --- HELPER: FILE READER ---
         const readFileChunk = (file, offset, length) => {
@@ -72,6 +89,23 @@
             });
         };
 
+        // --- HELPER: BACKPRESSURE-AWARE SEND ---
+        // Waits until the data channel buffer drains below the threshold, then sends.
+        const sendWithBackpressure = (conn, data) => {
+            return new Promise((resolve) => {
+                const trySend = () => {
+                    const dc = conn.dataChannel;
+                    if (dc && dc.bufferedAmount > MAX_BUFFERED_AMOUNT) {
+                        setTimeout(trySend, 50);
+                    } else {
+                        conn.send(data);
+                        resolve();
+                    }
+                };
+                trySend();
+            });
+        };
+
         // --- SENDER COMPONENT ---
         const SendTab = ({ setGlobalStatus }) => {
             const [file, setFile] = useState(null);
@@ -80,87 +114,122 @@
             const [transferState, setTransferState] = useState('idle'); // idle, waiting, sending, complete
             const peerRef = useRef(null);
             const connRef = useRef(null);
+            const fileRef = useRef(null);          // stable ref for async callbacks
+            const transferStateRef = useRef('idle'); // stale-closure-safe state mirror
 
-            useEffect(() => {
-                return () => {
-                    if (peerRef.current) peerRef.current.destroy();
-                };
-            }, []);
+            const setTState = (s) => { transferStateRef.current = s; setTransferState(s); };
 
-            const handleFileChange = (e) => {
-                if (e.target.files[0]) {
-                    setFile(e.target.files[0]);
-                    initializePeer();
-                }
+            // Destroy peer and connection cleanly
+            const destroyPeer = () => {
+                if (connRef.current)  { try { connRef.current.close();   } catch(e){} connRef.current  = null; }
+                if (peerRef.current)  { try { peerRef.current.destroy(); } catch(e){} peerRef.current  = null; }
             };
 
-            const initializePeer = () => {
+            // Cleanup on unmount (e.g. switching to Receive tab)
+            useEffect(() => { return () => destroyPeer(); }, []);
+
+            const handleCancel = () => {
+                destroyPeer();
+                setTState('idle');
+                setFile(null); fileRef.current = null;
+                setCode(null);
+                setProgress(0);
+                setGlobalStatus(">> TRANSFER CANCELLED.");
+            };
+
+            const handleFileChange = (e) => {
+                const selected = e.target.files[0];
+                if (!selected) return;
+                // Destroy any existing peer before initialising a new one
+                destroyPeer();
+                setTState('idle');
+                setProgress(0);
+                setFile(selected);
+                fileRef.current = selected;
+                initializePeer(selected);
+            };
+
+            const initializePeer = (selectedFile) => {
                 const generatedCode = Math.floor(100000 + Math.random() * 900000).toString();
                 setCode(generatedCode);
-                setTransferState('waiting');
+                setTState('waiting');
                 setGlobalStatus(">> INITIALIZING NODE. WAITING FOR HANDSHAKE...");
 
                 const peer = new Peer(generatedCode, {
                     debug: 1,
                     config: { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] }
                 });
-
                 peerRef.current = peer;
+
+                peer.on('error', (err) => {
+                    setGlobalStatus(peerErrorMsg(err));
+                    setTState('idle');
+                    destroyPeer();
+                });
 
                 peer.on('connection', (conn) => {
                     setGlobalStatus(">> PEER LINKED. PREPARING UPLOAD...");
                     connRef.current = conn;
-                    
+
+                    conn.on('error', (err) => {
+                        setGlobalStatus(`!! LINK ERROR: ${err.message || err} !!`);
+                        setTState('idle');
+                    });
+
+                    conn.on('close', () => {
+                        if (transferStateRef.current !== 'complete') {
+                            setGlobalStatus("!! LINK CLOSED UNEXPECTEDLY !!");
+                            setTState('idle');
+                        }
+                    });
+
                     conn.on('open', () => {
-                        startChunkedTransfer(conn);
+                        startChunkedTransfer(conn, selectedFile);
                     });
                 });
             };
 
-            const startChunkedTransfer = async (conn) => {
-                if (!file) return;
-                setTransferState('sending');
-                setGlobalStatus(`>> STARTING UPLOAD: ${file.name}`);
+            const startChunkedTransfer = async (conn, fileToSend) => {
+                if (!fileToSend) return;
+                setTState('sending');
+                setGlobalStatus(`>> STARTING UPLOAD: ${fileToSend.name}`);
 
                 try {
-                    const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
-                    
-                    // 1. Send Metadata
+                    const totalChunks = Math.ceil(fileToSend.size / CHUNK_SIZE);
+
+                    // 1. Send metadata first so receiver can allocate buffer
                     conn.send({
                         type: 'meta',
-                        name: file.name,
-                        size: file.size,
-                        fileType: file.type,
+                        name: fileToSend.name,
+                        size: fileToSend.size,
+                        fileType: fileToSend.type,
                         totalChunks: totalChunks
                     });
 
-                    // 2. Send Chunks
+                    // 2. Send chunks with backpressure pacing
                     let offset = 0;
                     for (let i = 0; i < totalChunks; i++) {
-                        const chunkData = await readFileChunk(file, offset, CHUNK_SIZE);
-                        
-                        conn.send({
-                            type: 'chunk',
-                            index: i,
-                            data: chunkData
-                        });
+                        // Bail out if transfer was cancelled or link dropped
+                        if (!connRef.current) {
+                            setGlobalStatus("!! LINK LOST DURING UPLOAD !!");
+                            setTState('idle');
+                            return;
+                        }
 
+                        const chunkData = await readFileChunk(fileToSend, offset, CHUNK_SIZE);
+                        await sendWithBackpressure(conn, { type: 'chunk', index: i, data: chunkData });
                         offset += CHUNK_SIZE;
-                        
-                        // Update UI
+
                         const percent = Math.round(((i + 1) / totalChunks) * 100);
                         setProgress(percent);
-
-                        // Mandatory Delay
-                        await new Promise(r => setTimeout(r, CHUNK_DELAY));
                     }
 
                     setGlobalStatus(">> UPLOAD COMPLETE. CLOSING LINK.");
-                    setTransferState('complete');
+                    setTState('complete');
                     setTimeout(() => {
-                        conn.close();
-                        setTransferState('idle');
-                        setFile(null);
+                        destroyPeer();
+                        setTState('idle');
+                        setFile(null); fileRef.current = null;
                         setCode(null);
                         setProgress(0);
                     }, 3000);
@@ -168,7 +237,7 @@
                 } catch (err) {
                     console.error(err);
                     setGlobalStatus("!! UPLOAD ERROR: ABORTED !!");
-                    setTransferState('idle');
+                    setTState('idle');
                 }
             };
 
@@ -194,6 +263,12 @@
                                     <div className="text-6xl md:text-8xl font-extrabold glow-text text-white">
                                         {code.substring(0, 3)}-{code.substring(3, 6)}
                                     </div>
+                                    <button
+                                        onClick={handleCancel}
+                                        className="mt-6 px-6 py-2 border border-red-700 text-red-500 text-xs font-bold rounded hover:bg-red-900/30 transition-all tracking-widest"
+                                    >
+                                        ✕ CANCEL
+                                    </button>
                                 </div>
                             )}
 
@@ -228,20 +303,53 @@
             const [inputCode, setInputCode] = useState("");
             const [progress, setProgress] = useState(0);
             const [isReceiving, setIsReceiving] = useState(false);
-            
+
             // Refs for high-frequency data handling
             const peerRef = useRef(null);
+            const connRef = useRef(null);
             const chunksRef = useRef([]);
             const metaRef = useRef(null);
+            const receivedCountRef = useRef(0);   // O(1) progress tracking
+            const connectTimeoutRef = useRef(null);
+            const transferDoneRef = useRef(false); // stale-closure guard
+
+            // Cleanup on unmount (e.g. switching to Send tab)
+            useEffect(() => { return () => { clearConnectTimeout(); destroyPeer(); }; }, []);
+
+            const clearConnectTimeout = () => {
+                if (connectTimeoutRef.current) {
+                    clearTimeout(connectTimeoutRef.current);
+                    connectTimeoutRef.current = null;
+                }
+            };
+
+            const destroyPeer = () => {
+                clearConnectTimeout();
+                if (connRef.current)  { try { connRef.current.close();   } catch(e){} connRef.current  = null; }
+                if (peerRef.current)  { try { peerRef.current.destroy(); } catch(e){} peerRef.current  = null; }
+            };
+
+            // Auto-format input: strip non-digits, auto-insert dash after 3 digits
+            const handleCodeInput = (e) => {
+                const digits = e.target.value.replace(/\D/g, '').slice(0, 6);
+                setInputCode(digits.length <= 3 ? digits : digits.slice(0, 3) + '-' + digits.slice(3));
+            };
+
+            const cleanCode = inputCode.replace(/\D/g, '');
 
             const handleConnect = () => {
-                if (inputCode.length < 6) return;
-                
-                const cleanCode = inputCode.replace(/-/g, '');
+                if (cleanCode.length < 6) return;
+
+                // Destroy any leftover peer from a previous attempt
+                destroyPeer();
+                transferDoneRef.current = false;
+
                 setGlobalStatus(`>> SCANNING FOR FREQUENCY ${cleanCode}...`);
                 setIsReceiving(true);
                 setProgress(0);
-                chunksRef.current = []; // Reset chunks
+                chunksRef.current = [];
+                metaRef.current = null;
+                receivedCountRef.current = 0;
 
                 const peer = new Peer(null, {
                     debug: 1,
@@ -249,67 +357,84 @@
                 });
                 peerRef.current = peer;
 
+                peer.on('error', (err) => {
+                    clearConnectTimeout();
+                    setGlobalStatus(peerErrorMsg(err));
+                    setIsReceiving(false);
+                    if (peerRef.current === peer) destroyPeer();
+                });
+
                 peer.on('open', () => {
-                    const conn = peer.connect(cleanCode);
-                    
+                    const conn = peer.connect(cleanCode, { reliable: true });
+                    connRef.current = conn;
+
+                    // Connection timeout: sender not found within CONNECT_TIMEOUT_MS
+                    connectTimeoutRef.current = setTimeout(() => {
+                        if (!transferDoneRef.current) {
+                            setGlobalStatus("!! TIMEOUT: FREQUENCY NOT FOUND OR OFFLINE !!");
+                            setIsReceiving(false);
+                            destroyPeer();
+                        }
+                    }, CONNECT_TIMEOUT_MS);
+
                     conn.on('open', () => {
+                        clearConnectTimeout();
                         setGlobalStatus(">> LINK ESTABLISHED. AWAITING STREAM...");
                     });
 
-                    conn.on('data', (data) => {
-                        handleIncomingData(data, conn);
-                    });
+                    conn.on('data', (data) => { handleIncomingData(data); });
 
                     conn.on('close', () => {
-                        // Cleanup if closed externally
-                         if (progress < 100 && progress > 0) {
+                        clearConnectTimeout();
+                        if (!transferDoneRef.current) {
                             setGlobalStatus("!! CONNECTION LOST !!");
                             setIsReceiving(false);
+                            destroyPeer();
                         }
                     });
-                    
-                    conn.on('error', () => {
-                        setGlobalStatus("!! CONNECTION ERROR !!");
+
+                    conn.on('error', (err) => {
+                        clearConnectTimeout();
+                        setGlobalStatus(`!! CONNECTION ERROR: ${err.message || err} !!`);
                         setIsReceiving(false);
+                        destroyPeer();
                     });
-                });
-                
-                peer.on('error', () => {
-                    setGlobalStatus("!! FREQUENCY NOT FOUND !!");
-                    setIsReceiving(false);
                 });
             };
 
-            const handleIncomingData = (data, conn) => {
+            const handleIncomingData = (data) => {
                 try {
                     // 1. Handle Metadata
                     if (data.type === 'meta') {
                         metaRef.current = data;
                         chunksRef.current = new Array(data.totalChunks);
+                        receivedCountRef.current = 0;
                         setGlobalStatus(`>> INCOMING: ${data.name} (${(data.size/1024/1024).toFixed(2)} MB)`);
                         return;
                     }
 
-                    // 2. Handle Chunks
+                    // 2. Handle Chunks — metadata must arrive first
                     if (data.type === 'chunk') {
-                        if (!metaRef.current) return; // Safety check
-                        
-                        // Store chunk at correct index
-                        chunksRef.current[data.index] = data.data;
-                        
-                        // Calculate Progress
-                        const receivedCount = chunksRef.current.filter(Boolean).length;
-                        const total = metaRef.current.totalChunks;
-                        const percent = Math.round((receivedCount / total) * 100);
-                        
-                        // Only trigger render if percentage changes to save resources
+                        if (!metaRef.current) return;
+
+                        // Guard against duplicate delivery (undefined or null)
+                        if (chunksRef.current[data.index] == null) {
+                            chunksRef.current[data.index] = data.data;
+                            receivedCountRef.current += 1; // O(1) counter
+                        }
+
+                        const total    = metaRef.current.totalChunks;
+                        const received = receivedCountRef.current;
+                        const percent  = Math.round((received / total) * 100);
+
+                        // Only trigger a re-render when the displayed percentage changes
                         setProgress(prev => (prev !== percent ? percent : prev));
 
-                        // 3. Reassembly on Completion
-                        if (receivedCount === total) {
+                        // 3. Reassembly on completion
+                        if (received === total) {
+                            transferDoneRef.current = true;
                             setGlobalStatus(">> ALL PACKETS SECURED. REASSEMBLING...");
                             finalizeDownload();
-                            conn.close();
                         }
                     }
                 } catch (err) {
@@ -319,25 +444,28 @@
             };
 
             const finalizeDownload = () => {
-                const blob = new Blob(chunksRef.current, { type: metaRef.current.fileType });
-                const url = URL.createObjectURL(blob);
-                
+                const meta = metaRef.current;
+                const blob = new Blob(chunksRef.current, { type: meta.fileType });
+                const url  = URL.createObjectURL(blob);
+
                 const link = document.createElement('a');
-                link.download = metaRef.current.name;
+                link.download = meta.name;
                 link.href = url;
                 document.body.appendChild(link);
                 link.click();
                 document.body.removeChild(link);
-                
-                // Cleanup
-                window.URL.revokeObjectURL(url);
+
+                URL.revokeObjectURL(url);
                 setGlobalStatus(">> ASSET WRITTEN TO DISK.");
-                
+
                 setTimeout(() => {
+                    destroyPeer();
                     setIsReceiving(false);
                     setProgress(0);
                     chunksRef.current = [];
                     metaRef.current = null;
+                    receivedCountRef.current = 0;
+                    transferDoneRef.current = false;
                 }, 2000);
             };
 
@@ -348,9 +476,11 @@
                             <div className="w-full">
                                 <label className="block text-xs text-green-500 mb-2 tracking-widest uppercase">Enter Source Frequency</label>
                                 <input 
-                                    type="text" 
+                                    type="text"
+                                    inputMode="numeric"
                                     value={inputCode}
-                                    onChange={(e) => setInputCode(e.target.value)}
+                                    onChange={handleCodeInput}
+                                    onKeyDown={(e) => { if (e.key === 'Enter' && cleanCode.length === 6) handleConnect(); }}
                                     placeholder="000-000"
                                     maxLength="7"
                                     className="w-full bg-black border-2 border-green-800 focus:border-green-400 text-center text-4xl md:text-6xl py-4 outline-none text-white placeholder-green-900/50 font-bold tracking-widest rounded"
@@ -358,9 +488,9 @@
                             </div>
                             <button 
                                 onClick={handleConnect}
-                                disabled={inputCode.length < 6}
+                                disabled={cleanCode.length < 6}
                                 className={`w-full py-6 text-xl font-bold border-2 border-green-500 bg-green-900/20 text-green-400 rounded uppercase tracking-widest hover:bg-green-500 hover:text-black transition-all
-                                    ${inputCode.length < 6 ? 'opacity-50 cursor-not-allowed' : ''}`}
+                                    ${cleanCode.length < 6 ? 'opacity-50 cursor-not-allowed' : ''}`}
                             >
                                 Initiate Downlink
                             </button>
@@ -405,7 +535,7 @@
                         </div>
                         <div className="text-right hidden md:block text-xs text-green-800">
                             <p>CHUNK_SIZE: 16KB</p>
-                            <p>LATENCY_PAD: 50MS</p>
+                            <p>BACKPRESSURE: 256KB</p>
                         </div>
                     </header>
 
