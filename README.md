@@ -1,8 +1,10 @@
 # NEO-LINK // CHUNKED TRANSFER
 
-A sleek, terminal-inspired, **peer-to-peer file transfer web app** built with React, WebRTC, and PeerJS. Send files directly from one browser to another—**no servers, no uploads, no third parties**. Just enter a 6-digit code, and transfer securely over encrypted WebRTC connections.
+A sleek, terminal-inspired, **peer-to-peer file transfer web app** built with React, WebRTC, and PeerJS. Send files directly from one browser to another—**no cloud uploads, no third-party storage**. Just enter a 6-digit code and transfer over an encrypted WebRTC data channel.
 
-Designed for creatives, developers, and educators who need fast, private, and offline-capable file sharing—ideal for workshops, on-set media exchange, or quick collaboration in environments like Dubai’s fast-paced production studios.
+Designed for creatives, developers, and educators who need fast, private file sharing—ideal for workshops, on-set media exchange, or quick collaboration in environments like Dubai’s fast-paced production studios.
+
+> **Note:** A signaling server is required for the initial peer-to-peer handshake. By default this uses PeerJS’s public server (`0.peerjs.com`). Once the WebRTC connection is established, all file data travels directly between browsers without touching any server.
 
 >> https://joenasriani.github.io/neo-link/
 
@@ -15,7 +17,7 @@ Designed for creatives, developers, and educators who need fast, private, and of
 3. File is **chunked into 16KB packets**, streamed securely via WebRTC.
 4. Receiver **automatically downloads** the reassembled file.
 
-All communication is **end-to-end** in the browser. No data touches any server.
+File data is transferred **directly peer-to-peer** between browsers via WebRTC. A signaling server is needed only for the initial connection handshake—no file data ever passes through a server.
 
 ---
 
@@ -53,7 +55,7 @@ All communication is **end-to-end** in the browser. No data touches any server.
 
 - Transfer large media files (video, audio, design assets) on set or in studios
 - Share work samples during client workshops (e.g., UAE government or luxury brand sessions)
-- Offline-compatible file exchange in low-connectivity environments
+- File sharing without cloud intermediaries for private, direct transfers
 - Teaching WebRTC concepts in creative tech courses
 
 ---
