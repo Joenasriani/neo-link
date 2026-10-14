@@ -88,3 +88,13 @@ This project is for demonstration and educational use.
 
 > **Try it live**: [Deploy your own via GitHub Pages](#-deploy-to-github-pages-in-1-minute)  
 > **Contact**: [joenasr@gmail.com](mailto:joenasr@gmail.com) | [LinkedIn](https://www.linkedin.com/in/joenasrprofile)
+
+## Implementation and privacy caveats
+
+The single-file `index.html` application uses PeerJS, WebRTC, React via browser scripts, and 16,384-byte file chunks. The six-digit pairing code is generated with `Math.random()`; it is a connection locator, **not strong authentication or a security credential**. Do not describe the app as an authenticated secure transfer service for sensitive material. WebRTC connection establishment relies on external signaling and network conditions; successful direct connections are not guaranteed on every network.
+
+The browser-side demonstration has not been independently penetration-tested or validated for production use.
+
+Credit: Joe Nasr
+
+Portfolio: https://joe-nasr-signals.vercel.app/
